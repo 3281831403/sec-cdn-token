@@ -7,6 +7,24 @@
 - 有效期容差为 0：now 等于 expires 即视为过期，剩余时间超出上限 1 秒即拒绝。
 """
 
+import hashlib
+import hmac
+import re
+from urllib.parse import urlsplit
+
+
+def _scope_covers(parent: str, child: str) -> bool:
+    """路径段边界判定：parent 作用域是否覆盖 child 作用域。
+
+    相等、parent 为根、或 child 以 parent 加斜杠开头才算覆盖；
+    纯字符串前缀（如 /video 命中 /video2）不算。
+    """
+    if parent == child:
+        return True
+    if parent == "/":
+        return True
+    return child.startswith(parent + "/")
+
 
 def normalize_path(path: str) -> str:
     """规范化请求路径。
@@ -21,7 +39,23 @@ def normalize_path(path: str) -> str:
 
     示例：//video///a.mp4?token=abc 规范化后为 /video/a.mp4。
     """
-    raise NotImplementedError
+    # 缺陷 1：去掉查询串与片段，取问号、井号中最先出现的位置
+    if not isinstance(path, str) or path == "":
+        return "/"
+    cut = len(path)
+    for sep in ("?", "#"):
+        idx = path.find(sep)
+        if idx != -1 and idx < cut:
+            cut = idx
+    path = path[:cut]
+
+    # 缺陷 2：折叠连续重复斜杠，杜绝 // 绕道路径
+    path = re.sub(r"/+", "/", path)
+    if path == "":
+        return "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
 
 
 def token_scope(path: str) -> str:
@@ -37,7 +71,13 @@ def token_scope(path: str) -> str:
       所有路径，但不覆盖 /video2 或 /video2/a.mp4。
     - 不使用星号字符，也不按扩展名猜测目录或文件。
     """
-    raise NotImplementedError
+    # 缺陷 3：作用域按请求路径逐段收敛，不再整站共用根作用域
+    normalized = normalize_path(path)
+    if normalized == "/":
+        return "/"
+    if normalized.endswith("/"):
+        return normalized[:-1]
+    return normalized
 
 
 def sign_token(secret: str, scope: str, expires: int) -> str:
@@ -51,7 +91,14 @@ def sign_token(secret: str, scope: str, expires: int) -> str:
 
     不读取系统时间，不使用随机数；相同输入必须产生相同令牌。
     """
-    raise NotImplementedError
+    # 缺陷 5：令牌正文携带过期时间，参与签名，无法被剥离或篡改
+    body = f"{scope}:{expires}"
+    mac = hmac.new(
+        secret.encode("utf-8"),
+        body.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{body}:{mac}"
 
 
 def verify_token(secret: str, token: str, scope: str, now: int) -> bool:
@@ -66,7 +113,31 @@ def verify_token(secret: str, token: str, scope: str, now: int) -> bool:
 
     格式错误、签名错误、作用域不匹配或已过期都返回 False，不抛异常。
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(token, str) or not isinstance(secret, str):
+            return False
+        parts = token.split(":")
+        if len(parts) != 3:
+            return False
+        issued_scope, expires_text, mac = parts
+        expires = int(expires_text)
+
+        expected_mac = hmac.new(
+            secret.encode("utf-8"),
+            f"{issued_scope}:{expires}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(mac, expected_mac):
+            return False
+
+        # 缺陷 4：按路径段边界判覆盖，/video 不再命中 /video2
+        if not _scope_covers(issued_scope, scope):
+            return False
+
+        # 缺陷 6：严格小于，now == expires 即过期，容差为 0
+        return now < expires
+    except Exception:
+        return False
 
 
 def referer_ok(referer: str, allow: list[str]) -> bool:
@@ -83,7 +154,35 @@ def referer_ok(referer: str, allow: list[str]) -> bool:
     - 禁止只用字符串后缀比较：example.com 不得命中 evil-example.com、
       notexample.com 或 example.com.evil.test。
     """
-    raise NotImplementedError
+    # 缺陷 8：精确主机名或路径段式子域通配，杜绝后缀仿冒
+    if not referer or not allow:
+        return False
+    try:
+        host = urlsplit(referer).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    # 单独的星号等于不限制来源，失败闭合一律拒绝
+    if "*" in allow:
+        return False
+
+    for item in allow:
+        if not isinstance(item, str) or item == "":
+            continue
+        if item.startswith("*."):
+            suffix = item[2:]
+            # 星号只允许在最前面出现一次，否则是非法通配
+            if not suffix or "*" in suffix:
+                continue
+            if host != suffix and host.endswith("." + suffix):
+                return True
+        else:
+            if "*" in item:
+                continue
+            if host == item:
+                return True
+    return False
 
 
 def expiry_ok(expires: int, now: int, max_ttl: int) -> bool:
@@ -93,7 +192,17 @@ def expiry_ok(expires: int, now: int, max_ttl: int) -> bool:
     max_ttl。容差 0：now 等于 expires 判为过期；剩余时间恰好等于 max_ttl
     允许，多 1 秒即拒绝。max_ttl 非正时返回 False。参数不是整数时返回 False。
     """
-    raise NotImplementedError
+    # 缺陷 6、7：到期边界严格小于，且剩余寿命不得超过签发上限
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (expires, now, max_ttl)
+    ):
+        return False
+    if max_ttl <= 0:
+        return False
+    if now >= expires:
+        return False
+    return expires - now <= max_ttl
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -108,7 +217,32 @@ def validate_policy(policy: dict) -> list[str]:
 
     没有任何问题时返回空列表。未知字段忽略。
     """
-    raise NotImplementedError
+    if not isinstance(policy, dict):
+        return ["no_referer", "ttl_too_long", "scope_too_wide"]
+
+    problems = []
+
+    allow = policy.get("allow")
+    if not allow or "*" in allow:
+        problems.append("no_referer")
+
+    ttl = policy.get("max_ttl")
+    if (
+        not isinstance(ttl, int)
+        or isinstance(ttl, bool)
+        or ttl <= 0
+        or ttl > 86400
+    ):
+        problems.append("ttl_too_long")
+
+    # 缺陷 9：根作用域或只有一级目录的作用域一律判为过宽
+    raw_scope = policy.get("scope")
+    scope = token_scope(raw_scope) if isinstance(raw_scope, str) else "/"
+    levels = [segment for segment in scope.split("/") if segment]
+    if len(levels) < 2:
+        problems.append("scope_too_wide")
+
+    return problems
 
 
 def cdn_batch(requests: list[dict], policy: dict, now: int) -> dict:
@@ -126,4 +260,57 @@ def cdn_batch(requests: list[dict], policy: dict, now: int) -> dict:
     不抛异常。返回字典，键为请求下标，从 0 开始，值为布尔结果；空请求列表
     返回空字典。不同请求、不同批次之间不得共享作用域或校验状态。
     """
-    raise NotImplementedError
+    if not isinstance(requests, list):
+        return {}
+
+    if not isinstance(policy, dict):
+        secret, allow, max_ttl, policy_scope = "", [], 0, "/"
+    else:
+        secret = policy.get("secret", "")
+        allow = policy.get("allow", [])
+        max_ttl = policy.get("max_ttl", 0)
+        raw_scope = policy.get("scope")
+        policy_scope = token_scope(raw_scope) if isinstance(raw_scope, str) else "/"
+
+    results = {}
+    for index, request in enumerate(requests):
+        try:
+            if not isinstance(request, dict):
+                results[index] = False
+                continue
+
+            # 缺陷 10：每个请求独立计算作用域，绝不复用上一个请求的结果
+            request_scope = token_scope(request["path"])
+            token = request["token"]
+            parts = token.split(":")
+            if len(parts) != 3:
+                results[index] = False
+                continue
+            issued_scope, expires_text, _mac = parts
+            try:
+                expires = int(expires_text)
+            except ValueError:
+                results[index] = False
+                continue
+
+            # 策略作用域覆盖令牌作用域，令牌作用域再覆盖请求路径
+            if not _scope_covers(policy_scope, issued_scope):
+                results[index] = False
+                continue
+            if not _scope_covers(issued_scope, request_scope):
+                results[index] = False
+                continue
+            if not verify_token(secret, token, request_scope, now):
+                results[index] = False
+                continue
+            if not referer_ok(request.get("referer"), allow):
+                results[index] = False
+                continue
+            if not expiry_ok(expires, now, max_ttl):
+                results[index] = False
+                continue
+
+            results[index] = True
+        except Exception:
+            results[index] = False
+    return results
